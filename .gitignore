@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+geo.db
+diagnostico_*.json
+relatorio_*.html
+blocos_schema_*.html
+*.pdf
+.DS_Store
+.streamlit/secrets.toml
