@@ -27,6 +27,15 @@ from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 # =============================================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -421,9 +430,31 @@ def is_safe_url(url: str) -> bool:
 # =============================================================================
 # FUNÇÕES UTILITÁRIAS (reutilizadas dos scripts originais)
 # =============================================================================
+def fetch_page_with_playwright(url: str, timeout: int = REQUEST_TIMEOUT):
+    """Usa Playwright para SPAs (React/Vue) — fallback para requests se falhar"""
+    if not PLAYWRIGHT_AVAILABLE:
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+            html = page.content()
+            browser.close()
+
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript", "svg"]):
+                tag.decompose()
+            text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+            return {"html": html, "text": text, "ok": True, "url": url}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "url": url}
+
+
 @st.cache_data(ttl=3600)
-def fetch_page_cached(url: str):
-    """Fetch com cache para não repetir requests."""
+def fetch_page_cached(url: str, use_playwright: bool = False):
+    """Fetch com cache, com fallback automático para Playwright em SPAs"""
     try:
         r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -432,8 +463,10 @@ def fetch_page_cached(url: str):
             tag.decompose()
         text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
         return {"html": r.text, "text": text, "ok": True, "url": url}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "url": url}
+    except Exception as e1:
+        if use_playwright and PLAYWRIGHT_AVAILABLE:
+            return fetch_page_with_playwright(url)
+        return {"ok": False, "error": str(e1), "url": url}
 
 def extract_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -563,8 +596,8 @@ def discover_urls(domain: str, home_html: str, max_pages: int) -> list:
             ranked.append(u)
     return ranked[:max_pages - 1]
 
-def diagnose_site(domain: str, geo_terms: list, max_pages: int, delay: float, progress_callback=None):
-    home = fetch_page_cached(f"https://{domain}")
+def diagnose_site(domain: str, geo_terms: list, max_pages: int, delay: float, use_playwright: bool = False, progress_callback=None):
+    home = fetch_page_cached(f"https://{domain}", use_playwright=use_playwright)
     if not home["ok"]:
         if progress_callback:
             progress_callback(home["url"], 1, 1, error=True)
@@ -579,7 +612,7 @@ def diagnose_site(domain: str, geo_terms: list, max_pages: int, delay: float, pr
         time.sleep(delay)
         if progress_callback:
             progress_callback(url, idx, max_pages)
-        p = fetch_page_cached(url)
+        p = fetch_page_cached(url, use_playwright=use_playwright)
         if p["ok"]:
             pages.append(p)
 
@@ -1159,6 +1192,127 @@ def build_report_html(diag, sov_rows, comp_counter, schema_html, marca, contato)
 </html>'''
 
 # =============================================================================
+# FUNÇÕES DE VISUALIZAÇÃO (Plotly)
+# =============================================================================
+def create_signal_heatmap(client_signals: dict, competitors_signals: list,
+                          competitor_domains: list) -> go.Figure:
+    """Cria heatmap interativo da matriz de sinais (cliente vs concorrentes)"""
+    signals = list(SIGNAL_LABELS.keys())
+    data = []
+    data.append([1 if client_signals.get(sig) else 0 for sig in signals])
+    for cs in competitors_signals:
+        data.append([1 if cs.get(sig) else 0 for sig in signals])
+
+    labels = ["Voce"] + [d for d in competitor_domains[:len(competitors_signals)]]
+
+    fig = px.imshow(
+        data,
+        labels=dict(x="Sinal tecnico", y="Site", color="Presente"),
+        x=[SIGNAL_LABELS[s][:30] for s in signals],
+        y=labels,
+        color_continuous_scale=[[0, "#C03B2D"], [1, "#1F7A4D"]],
+        aspect="auto",
+        text_auto=True,
+        height=400,
+    )
+    fig.update_layout(
+        margin=dict(l=20, r=20, t=40, b=20),
+        font=dict(family="IBM Plex Mono, monospace", size=10),
+        xaxis=dict(tickangle=45),
+    )
+    return fig
+
+
+def create_score_gauge(score: int, max_score: int) -> go.Figure:
+    """Cria gauge (velocimetro) para pontuacao geral"""
+    pct = round(100 * score / max_score, 1)
+    color = "#C03B2D" if pct < 40 else "#E8930C" if pct < 75 else "#1F7A4D"
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        number={'suffix': f"/{max_score}", 'font': {'size': 40}},
+        gauge={
+            'axis': {'range': [None, max_score], 'tickwidth': 1, 'tickcolor': "#15191C"},
+            'bar': {'color': color, 'thickness': 0.6},
+            'bgcolor': "#F4F4F1",
+            'borderwidth': 0,
+            'steps': [
+                {'range': [0, max_score * 0.4], 'color': "#F9E0DA"},
+                {'range': [max_score * 0.4, max_score * 0.7], 'color': "#FCE9CD"},
+                {'range': [max_score * 0.7, max_score], 'color': "#D9EFE4"},
+            ],
+            'threshold': {
+                'line': {'color': "#15191C", 'width': 2},
+                'thickness': 0.75,
+                'value': score,
+            },
+        }
+    ))
+    fig.update_layout(
+        height=250,
+        margin=dict(l=30, r=30, t=20, b=20),
+        font=dict(family="IBM Plex Mono, monospace"),
+    )
+    return fig
+
+
+def create_category_bar_chart(signals: dict) -> go.Figure:
+    """Cria grafico de barras por categoria (agrupamento logico)"""
+    categories = {
+        "Dados Estruturados": ["jsonld_localbusiness", "jsonld_organization", "jsonld_faqpage"],
+        "Acessibilidade IA": ["robots_ai_ok", "llms_txt", "sitemap"],
+        "Conteudo": ["faq_block", "question_headings_3plus", "geo_terms_ok"],
+        "NAP": ["nap_phone", "nap_cep"],
+        "Meta": ["meta_desc_ok"],
+    }
+
+    scores = {}
+    for cat, sigs in categories.items():
+        total = len(sigs)
+        ok = sum(1 for s in sigs if signals.get(s))
+        scores[cat] = round(ok / total * 100) if total else 0
+
+    df = pd.DataFrame(list(scores.items()), columns=["Categoria", "Proficiencia (%)"])
+
+    fig = px.bar(
+        df, x="Categoria", y="Proficiencia (%)",
+        color="Proficiencia (%)",
+        color_continuous_scale=["#C03B2D", "#E8930C", "#1F7A4D"],
+        text_auto=".0f",
+        height=250,
+    )
+    fig.update_layout(
+        xaxis_title=None,
+        font=dict(family="Archivo, sans-serif"),
+        plot_bgcolor="white",
+        yaxis=dict(gridcolor="#E3E1DB", range=[0, 105]),
+        xaxis=dict(tickangle=0),
+        margin=dict(l=10, r=10, t=10, b=10),
+    )
+    fig.update_traces(marker_line_width=0, textposition="outside")
+    return fig
+
+
+def render_metric_dashboard(client_signals: dict, score: int, max_score: int,
+                            comps_count: int, recs_count: int):
+    """Renderiza o dashboard superior com metricas chave"""
+    pct = round(100 * score / max_score, 1)
+    signals_ok = sum(1 for v in client_signals.values() if v)
+    signals_total = len(client_signals)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Pontuacao de Prontidao", f"{score}/{max_score}", delta=f"{pct}%")
+    with col2:
+        st.metric("Sinais OK", f"{signals_ok}/{signals_total}")
+    with col3:
+        st.metric("Concorrentes", comps_count)
+    with col4:
+        st.metric("Recomendacoes Prioritarias", recs_count)
+
+
+# =============================================================================
 # INTERFACE STREAMLIT
 # =============================================================================
 def main():
@@ -1166,6 +1320,10 @@ def main():
     st.sidebar.markdown("## \u2699\uFE0F Configuração")
 
     modo = st.sidebar.radio("Modo de execução", ["\U0001f680 Produção (crawl real)", "\U0001f3ac Demo (dados simulados)"], index=1)
+    use_playwright = st.sidebar.checkbox("Suporte a SPA (React/Vue)",
+                                         value=False,
+                                         disabled=not PLAYWRIGHT_AVAILABLE,
+                                         help="Usa Playwright para renderizar JavaScript. Mais lento, mas necessario para sites modernos.")
 
     with st.sidebar.form("config_form"):
         domain = st.text_input("Domínio do cliente", value="mdaenergiasolar.com.br")
@@ -1179,9 +1337,9 @@ def main():
         submitted = st.form_submit_button("\U0001f4be Salvar configuração")
 
     # Corpo principal
-    st.markdown('<div class="eyebrow">MVP v1.0</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">MVP v2.0 — com visualizações interativas</div>', unsafe_allow_html=True)
     st.title("GEO Auditor")
-    st.markdown("**Diagnóstico completo de visibilidade em motores de IA — em um clique.**")
+    st.markdown("**Diagnóstico completo de visibilidade em motores de IA — com heatmap interativo e análise de SPAs.**")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -1276,6 +1434,7 @@ def main():
 
                     client_diag = diagnose_site(
                         domain, geo_terms, 6, 1.0,
+                        use_playwright=use_playwright,
                         progress_callback=crawl_progress
                     )
 
@@ -1301,7 +1460,7 @@ def main():
                         st.write(f"   \U0001f50d Crawleando concorrente {idx}/{len(comps)}: {c}")
                         time.sleep(0.5)
                         try:
-                            cd = diagnose_site(c, geo_terms, 4, 1.0, progress_callback=crawl_progress)
+                            cd = diagnose_site(c, geo_terms, 4, 1.0, use_playwright=use_playwright, progress_callback=crawl_progress)
                             if cd.get("ok"):
                                 comp_diags.append(cd)
                                 st.success(f"      \u2705 {c}: {len(cd.get('pages_crawled', []))} páginas")
@@ -1403,6 +1562,28 @@ def main():
                     <div class="metric-big">{rec_count}<small></small></div>
                     <div style="color: var(--muted); font-size: 13px; margin-top: 4px;">Correções prioritárias</div>
                 </div>''', unsafe_allow_html=True)
+
+            # ============ GRÁFICOS INTERATIVOS (PLOTLY) ============
+            st.subheader("Indice de Prontidao GEO")
+            client_signals = diag["client"]["signals"]
+            score_val = sc.get("client", 0)
+            max_score_val = sc.get("max", MAX_SCORE)
+
+            col_g1, col_g2 = st.columns([1, 1.5])
+            with col_g1:
+                st.plotly_chart(create_score_gauge(score_val, max_score_val), use_container_width=True)
+            with col_g2:
+                st.plotly_chart(create_category_bar_chart(client_signals), use_container_width=True)
+
+            comps_data = diag.get("competitors", [])
+            comp_signals = [c["signals"] for c in comps_data if c.get("ok")]
+            comp_domains = [c["domain"] for c in comps_data if c.get("ok")]
+            if comp_signals:
+                st.subheader("Matriz de Sinais Tecnicos")
+                st.plotly_chart(
+                    create_signal_heatmap(client_signals, comp_signals, comp_domains),
+                    use_container_width=True,
+                )
 
             # Downloads
             st.subheader("\U0001f4e5 Download do Laudo")
